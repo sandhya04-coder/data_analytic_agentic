@@ -1,0 +1,3 @@
+[server]
+folderWatchBlacklist = ["transformers", "torch"]
+fileWatcherType = "poll"
