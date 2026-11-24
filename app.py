@@ -1,12 +1,17 @@
-import json
 import uuid
 import pandas as pd
 import plotly.io as pio
 import streamlit as st
+from datetime import datetime
 from langgraph.types import Command
 from sqlalchemy import text
-
-from database.connection import get_engine, get_table_names
+from security.policy_guard import SSO_USERS, get_policies_for_db, set_active_policy
+from database.connection import (
+    get_engine,
+    get_table_names,
+    list_available_databases,
+    set_active_database,
+)
 from database.schema_inspector import SchemaInspector
 from graph.workflow import build_analytics_graph
 
@@ -14,7 +19,7 @@ from graph.workflow import build_analytics_graph
 # Page Config & Custom Styling
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Northwind BI • Multi-Agent Analytics Workbench",
+    page_title="Enterprise BI • Multi-Agent Analytics Workbench",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -68,6 +73,21 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+SAMPLE_PROMPTS_BY_DB = {
+    "northwind": [
+        "Top 5 products by revenue in 2017",
+        "Monthly revenue trend across 2017 and 2018",
+        "Why did revenue change between Q4 2017 and Q1 2018? Break down by category and region.",
+        "Which customers generated the highest revenue overall, and how many orders did they place?",
+    ],
+    "olist": [
+        "Top 10 product categories by total payment revenue",
+        "Monthly order volume and revenue trend across 2017 and 2018",
+        "Which customer states generated the highest revenue and average review score?",
+        "Why did revenue change between Q4 2017 and Q1 2018? Break down by top product categories and customer states.",
+    ],
+}
+
 
 # ---------------------------------------------------------------------------
 # Cached Database & Graph Helpers
@@ -78,33 +98,52 @@ def get_compiled_graph():
 
 
 @st.cache_data(ttl=300)
-def get_db_overview_stats() -> dict:
-    engine = get_engine()
-    inspector = SchemaInspector()
-    tables = get_table_names()
+def get_db_overview_stats(db_key: str, policy_id: str = "exec_admin") -> dict:
+    engine = get_engine(db_key)
+    inspector = SchemaInspector(db_key)
+    tables = inspector.get_all_tables()
+    schema = inspector.get_complete_schema()
     table_counts = {}
+    detected_date_range = "Schema-driven"
+
     with engine.connect() as conn:
         for t in tables:
             quoted = engine.dialect.identifier_preparer.quote(t)
             cnt = conn.execute(text(f"SELECT COUNT(*) FROM {quoted}")).scalar_one()
             table_counts[t] = int(cnt)
-        min_d, max_d = conn.execute(
-            text("SELECT MIN(OrderDate), MAX(OrderDate) FROM Orders")
-        ).one()
+
+        # Auto-detect the first date/timestamp column across any table in the active DB
+        for t in tables:
+            for col in schema.get(t, {}).get("columns", []):
+                col_name = col["name"]
+                col_type = str(col.get("type", "")).upper()
+                if any(k in col_name.lower() for k in ("date", "timestamp", "time", "created")) or any(
+                    dt in col_type for dt in ("DATE", "TIME")
+                ):
+                    q_tbl = engine.dialect.identifier_preparer.quote(t)
+                    q_col = engine.dialect.identifier_preparer.quote(col_name)
+                    res = conn.execute(
+                        text(f"SELECT MIN({q_col}), MAX({q_col}) FROM {q_tbl} WHERE {q_col} IS NOT NULL")
+                    ).first()
+                    if res and res[0] is not None and res[1] is not None:
+                        detected_date_range = f"{t}.{col_name}: {str(res[0])[:10]} → {str(res[1])[:10]}"
+                        break
+            if detected_date_range != "Schema-driven":
+                break
 
     return {
         "tables": tables,
         "table_counts": table_counts,
         "total_rows": sum(table_counts.values()),
-        "date_range": f"{str(min_d)[:10]} → {str(max_d)[:10]}",
-        "schema": inspector.get_complete_schema(),
+        "date_range": detected_date_range,
+        "schema": schema,
         "relationships": inspector.get_table_relationships(),
     }
 
 
 @st.cache_data(ttl=300)
-def load_table_preview(table_name: str, limit: int = 25) -> pd.DataFrame:
-    engine = get_engine()
+def load_table_preview(db_key: str, table_name: str, limit: int = 25) -> pd.DataFrame:
+    engine = get_engine(db_key)
     quoted = engine.dialect.identifier_preparer.quote(table_name)
     with engine.connect() as conn:
         return pd.read_sql(text(f"SELECT * FROM {quoted} LIMIT :lim"), conn, params={"lim": limit})
@@ -121,41 +160,62 @@ if "pending_clarification" not in st.session_state:
     st.session_state.pending_clarification = None
 if "history" not in st.session_state:
     st.session_state.history = []
-
-db_stats = get_db_overview_stats()
+if "auto_run_question" not in st.session_state:
+    st.session_state.auto_run_question = None
+if "audit_log" not in st.session_state:
+    st.session_state.audit_log = []
 
 # ---------------------------------------------------------------------------
-# Sidebar: Database Pulse & Sample Prompts
+# Sidebar: Multi-Tenant Database Switcher, Pulse & Sample Prompts
 # ---------------------------------------------------------------------------
+available_dbs = list_available_databases()
+
 with st.sidebar:
-    st.markdown("### 🗄️ Northwind Database Pulse")
-    c1, c2 = st.columns(2)
-    c1.metric("Tables", len(db_stats["tables"]))
-    c2.metric("Total Rows", f"{db_stats['total_rows']:,}")
-    st.caption(f"📅 **Orders Coverage:** `{db_stats['date_range']}`")
+    st.markdown("###  Enterprise SSO Session")
+    selected_email = st.selectbox(
+        "Authenticated Identity",
+        options=list(SSO_USERS.keys()),
+        format_func=lambda e: f"{SSO_USERS[e].full_name} ({e})",
+        key="sso_user_selector",
+    )
+    current_user = SSO_USERS[selected_email]
+    if st.session_state.get("active_sso_email") != selected_email:
+        st.session_state.active_sso_email = selected_email
+        st.session_state.result_state = None
+        st.session_state.pending_clarification = None
+    selected_db = current_user.db_key
+    active_policy = get_policies_for_db(selected_db)[current_user.policy_key]
 
-    with st.expander("📋 Table Row Counts", expanded=False):
-        counts_df = pd.DataFrame(
-            [{"Table": k, "Rows": v} for k, v in db_stats["table_counts"].items()]
-        )
-        st.dataframe(counts_df, hide_index=True, width="stretch", height=260)
+    set_active_database(selected_db)
+    set_active_policy(active_policy)
+
+    st.caption(f"**Role:** {current_user.title}")
+    st.caption(f"**Bound Tenant DB:** `{selected_db}.sqlite` (isolated)")
+    with st.expander("Decoded JWT & Security Claims", expanded=False):
+        st.json(current_user.claims)
+        if active_policy.row_filters:
+            st.caption(f"**ABAC Row Filter:** `{active_policy.row_filters}`")
+        if active_policy.allowed_tables is not None:
+            st.caption(f"**RBAC Tables:** `{', '.join(sorted(active_policy.allowed_tables))}`")
+        if active_policy.blocked_columns:
+            st.caption(f"**Hidden Columns:** `{active_policy.blocked_columns}`")
+
+    db_stats = get_db_overview_stats(selected_db, active_policy.policy_id)
 
     st.divider()
-    st.markdown("### 💡 Quick Analytical Prompts")
-    sample_prompts = [
-        "Top 5 products by revenue in 2017",
-        "Monthly revenue trend across 2017 and 2018",
-        "Why did revenue change between Q4 2017 and Q1 2018? Break down by category and region.",
-        "Which customers generated the highest revenue overall, and how many orders did they place?",
-        "Top 5 products by revenue in 2010",
-    ]
-    for sp in sample_prompts:
-        if st.button(sp, width="stretch"):
-            st.session_state.prefill_question = sp
+    st.markdown("### Quick Analytical Prompts")
+    sample_prompts = SAMPLE_PROMPTS_BY_DB.get(
+        selected_db,
+        [f"Summarize total rows and key metrics across {db_stats['tables'][0]}"],
+    )
+    for idx, sp in enumerate(sample_prompts):
+        if st.button(sp, key=f"sample_{selected_db}_{idx}", width="stretch"):
+            st.session_state.auto_run_question = sp
+            st.rerun()
 
     st.divider()
     if st.session_state.history:
-        st.markdown("### 🕘 Recent Queries")
+        st.markdown("###  Recent Queries")
         for idx, item in enumerate(reversed(st.session_state.history[-5:]), 1):
             st.caption(f"{idx}. {item}")
 
@@ -163,38 +223,60 @@ with st.sidebar:
 # Hero Header & Query Input Bar
 # ---------------------------------------------------------------------------
 st.markdown(
-    """
+    f"""
     <div class="hero-banner">
-        <h1>📊 Northwind Autonomous Business Intelligence</h1>
+        <h1>{selected_db.title()} Autonomous Business Intelligence</h1>
         <p>5-Agent LangGraph Pipeline • Intent → Evidence-Based Planning → Self-Correcting SQL → Deterministic Analytics → Executive Reporting</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-default_q = st.session_state.pop("prefill_question", "")
-with st.form("query_form", clear_on_submit=False):
+queued_q = st.session_state.pop("auto_run_question", None)
+
+with st.form("query_form", clear_on_submit=True):
     col_q, col_btn = st.columns([5, 1])
     user_question = col_q.text_input(
-        "Ask a business question about Northwind sales, products, customers, employees, or shipping:",
-        value=default_q,
-        placeholder="e.g., Top 5 products by revenue in 2017",
+        f"Ask a business question about {selected_db.title()} data:",
+        placeholder=f"e.g., {sample_prompts[0]}",
     )
-    submitted = col_btn.form_submit_button("Analyze 🚀", width="stretch")
+    submitted = col_btn.form_submit_button("Analyze ", width="stretch")
 
 # ---------------------------------------------------------------------------
 # Graph Execution (New Query or Clarification Resume)
 # ---------------------------------------------------------------------------
 graph = get_compiled_graph()
 
-if submitted and user_question.strip():
+if queued_q:
+    active_question = queued_q.strip()
+elif submitted and user_question.strip():
+    active_question = user_question.strip()
+else:
+    active_question = ""
+
+if active_question:
+    set_active_database(selected_db)
+    set_active_policy(active_policy)
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.pending_clarification = None
     config = {"configurable": {"thread_id": st.session_state.thread_id}}
 
+    prior_context = ""
+    if st.session_state.result_state and "report" in st.session_state.result_state:
+        prev_q = st.session_state.result_state.get("question", "")
+        prev_summary = st.session_state.result_state["report"].business_summary
+        prior_context = f"Previous Question: {prev_q}\nPrevious Findings Summary: {prev_summary}"
+
     with st.status("Running 5-Agent LangGraph Workflow...", expanded=True) as status:
-        st.write("🧠 **Agent 1 & 2:** Understanding business intent & profiling database schema...")
-        final_state = graph.invoke({"question": user_question.strip(), "trace_log": []}, config=config)
+        st.write(" **Agent 1 & 2:** Understanding business intent & profiling database schema...")
+        final_state = graph.invoke(
+            {
+                "question": active_question,
+                "prior_context": prior_context,
+                "trace_log": [],
+            },
+            config=config,
+        )
 
         snapshot = graph.get_state(config)
         if snapshot.next:
@@ -205,7 +287,16 @@ if submitted and user_question.strip():
             status.update(label="Clarification needed from user", state="running")
         else:
             st.session_state.result_state = final_state
-            st.session_state.history.append(user_question.strip())
+            st.session_state.history.append(f"[{current_user.email}] {active_question}")
+            st.session_state.audit_log.append({
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "User": current_user.email,
+                "Database": selected_db,
+                "Role": active_policy.display_name,
+                "Question": active_question,
+                "Queries": len(final_state["sql_output"].executions),
+                "Status": "Success" if final_state["report"].is_successful else "Blocked / Limited",
+            })
             status.update(label="Analysis complete!", state="complete", expanded=False)
 
 # Handle Human-in-the-Loop Clarification Interrupt
@@ -214,6 +305,8 @@ if st.session_state.pending_clarification:
     with st.form("clarify_form"):
         clarify_reply = st.text_input("Your clarification:")
         if st.form_submit_button("Resume Analysis"):
+            set_active_database(selected_db)
+            set_active_policy(active_policy)
             config = {"configurable": {"thread_id": st.session_state.thread_id}}
             with st.status("Resuming workflow...", expanded=True) as status:
                 final_state = graph.invoke(Command(resume=clarify_reply), config=config)
@@ -228,10 +321,10 @@ state = st.session_state.result_state
 
 tab_report, tab_sql, tab_pipeline, tab_db = st.tabs(
     [
-        "📈 Executive Report & Charts",
-        "🧾 SQL Queries & Data Audit",
-        "🤖 Agent Pipeline & Reasoning",
-        "🗄️ Database Explorer",
+        " Executive Report & Charts",
+        " SQL Queries & Data Audit",
+        " Agent Pipeline & Reasoning",
+        " Database Explorer",
     ]
 )
 
@@ -273,7 +366,6 @@ with tab_report:
         st.markdown("### Executive Summary")
         st.info(report.business_summary)
 
-        # 3. Multi-Chart Visual Analytics Grid (Comparison + Heatmap + Treemap + Pareto)
         # 3. Multi-Chart Visual Analytics Grid (Full-width for dense matrices, 2-col for compact views)
         if report.charts:
             st.markdown(f"### Visual Analytics Suite ({len(report.charts)} Interactive Views)")
@@ -340,36 +432,36 @@ with tab_report:
                     """,
                     unsafe_allow_html=True,
                 )
-        
+
         if getattr(report, "follow_up_questions", None):
-            st.markdown("### 🔍 Recommended Drill-Down Questions")
+            st.markdown("###  Recommended Drill-Down Questions")
             fq_cols = st.columns(len(report.follow_up_questions))
             for idx, (col, fq) in enumerate(zip(fq_cols, report.follow_up_questions)):
                 if col.button(f"↪ {fq}", key=f"fq_{idx}", width="stretch"):
-                    st.session_state.prefill_question = fq
+                    st.session_state.auto_run_question = fq
                     st.rerun()
 
         # 7. Deduplicated Caveats & Dual Report Downloads (.html with live charts + .md)
         dedup_notes = list(dict.fromkeys(report.supporting_evidence_notes + analysis.data_caveats))
         if dedup_notes:
-            with st.expander("📌 Methodology & Data Caveats", expanded=not report.is_successful):
+            with st.expander(" Methodology & Data Caveats", expanded=not report.is_successful):
                 for note in dedup_notes:
                     st.markdown(f"- {note}")
 
         dl_col1, dl_col2, _ = st.columns([1.5, 1.5, 3])
         if getattr(report, "report_html", ""):
             dl_col1.download_button(
-                label="📊 Download Full Interactive Report (.html)",
+                label=" Download Full Interactive Report (.html)",
                 data=report.report_html,
-                file_name="executive_report_with_charts.html",
+                file_name=f"{selected_db}_executive_report.html",
                 mime="text/html",
                 width="stretch",
             )
         if report.report_markdown:
             dl_col2.download_button(
-                label="📝 Download Markdown Brief (.md)",
+                label=" Download Markdown Brief (.md)",
                 data=report.report_markdown,
-                file_name="executive_brief.md",
+                file_name=f"{selected_db}_executive_brief.md",
                 mime="text/markdown",
                 width="stretch",
             )
@@ -389,7 +481,7 @@ with tab_sql:
         else:
             for idx, ex in enumerate(sql_out.executions, 1):
                 q_meta = queries_by_id.get(ex.task_id)
-                header = f"Query {idx}: `{ex.task_id}` — {'✅ Success' if ex.success else '❌ Failed'} ({ex.row_count} rows, {ex.attempts} attempt(s))"
+                header = f"Query {idx}: `{ex.task_id}` — {' Success' if ex.success else '❌ Failed'} ({ex.row_count} rows, {ex.attempts} attempt(s))"
                 with st.expander(header, expanded=True):
                     if q_meta:
                         st.caption(f"**Purpose:** {q_meta.explanation} | **Tables:** {', '.join(q_meta.tables_used)}")
@@ -401,12 +493,16 @@ with tab_sql:
                         df_res = pd.DataFrame(ex.rows)
                         st.dataframe(df_res, width="stretch")
                         st.download_button(
-                            label=f"⬇️ Download {ex.task_id} Results (.csv)",
+                            label=f"⬇ Download {ex.task_id} Results (.csv)",
                             data=df_res.to_csv(index=False),
                             file_name=f"{ex.task_id}.csv",
                             mime="text/csv",
                             key=f"dl_{ex.task_id}_{idx}",
                         )
+            if st.session_state.audit_log:
+                st.divider()
+                st.markdown("####  Session Security & Query Audit Log")
+                st.dataframe(pd.DataFrame(reversed(st.session_state.audit_log)), hide_index=True, width="stretch")
 
 # === TAB 3: AGENT PIPELINE & REASONING ===
 with tab_pipeline:
@@ -420,18 +516,18 @@ with tab_pipeline:
         col_a, col_b = st.columns(2)
         with col_a:
             if "intent" in state:
-                with st.expander("1️⃣ Agent 1: BusinessIntent", expanded=True):
+                with st.expander("1️ Agent 1: BusinessIntent", expanded=True):
                     st.json(state["intent"].model_dump(mode="json"))
             if "analysis" in state:
-                with st.expander("4️⃣ Agent 4: Deterministic Analytics & Findings", expanded=True):
+                with st.expander("4️ Agent 4: Deterministic Analytics & Findings", expanded=True):
                     st.json(state["analysis"].model_dump(mode="json"))
 
         with col_b:
             if "plan" in state:
-                with st.expander("2️⃣ Agent 2: AnalysisPlan (DAG)", expanded=True):
+                with st.expander("2️ Agent 2: AnalysisPlan (DAG)", expanded=True):
                     st.json(state["plan"].model_dump(mode="json"))
             if "report" in state:
-                with st.expander("5️⃣ Agent 5: Report Metadata", expanded=False):
+                with st.expander("5️ Agent 5: Report Metadata", expanded=False):
                     st.json(
                         state["report"].model_dump(
                             mode="json", exclude={"report_markdown", "report_html", "charts"}
@@ -440,8 +536,8 @@ with tab_pipeline:
 
 # === TAB 4: LIVE DATABASE EXPLORER ===
 with tab_db:
-    st.markdown("#### Northwind SQLite Schema & Live Table Preview")
-    selected_table = st.selectbox("Select a table to inspect:", db_stats["tables"], index=7)  # defaults to Orders
+    st.markdown(f"#### {selected_db.title()} SQLite Schema & Live Table Preview")
+    selected_table = st.selectbox("Select a table to inspect:", db_stats["tables"], index=0,key=f"db_explorer_table_{selected_db}_{active_policy.policy_id}")
 
     t_info = db_stats["schema"][selected_table]
     m1, m2, m3 = st.columns(3)
@@ -461,7 +557,7 @@ with tab_db:
             {
                 "Column": c["name"],
                 "Type": c["type"],
-                "PK": "🔑" if c["name"] in t_info["primary_keys"] else "",
+                "PK": "PK" if c["name"] in t_info["primary_keys"] else "",
                 "Foreign Key": fk_map.get(c["name"], ""),
             }
             for c in t_info["columns"]
@@ -470,5 +566,5 @@ with tab_db:
 
     with c_preview:
         st.markdown(f"**Sample Records (`{selected_table}`)**")
-        preview_df = load_table_preview(selected_table, limit=25)
+        preview_df = load_table_preview(selected_db, selected_table, limit=25)
         st.dataframe(preview_df, hide_index=True, width="stretch")

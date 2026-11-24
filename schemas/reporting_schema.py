@@ -1,7 +1,21 @@
 from enum import Enum
 from pydantic import BaseModel, Field
 
+from typing import Literal
 
+class ChartSpec(BaseModel):
+    task_id: str = Field(..., description="Exact task_id from the executed SQL query to plot.")
+    chart_type: Literal["bar", "grouped_bar", "line", "scatter", "heatmap", "treemap", "pareto"] = Field(
+        ..., description="Best chart type for this specific question and data shape."
+    )
+    x_col: str = Field(..., description="Exact column name for the X-axis (or category/hierarchy root).")
+    y_col: str = Field(..., description="Exact numeric column name for the Y-axis (or metric value).")
+    color_col: str | None = Field(
+        default=None,
+        description="Optional exact column name for series grouping / color encoding (e.g., year or category).",
+    )
+    title: str = Field(..., description="Clear executive chart title.")
+    subtitle: str = Field(default="", description="One-line analytical takeaway or axis context.")
 class RecommendationPriority(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"
@@ -74,6 +88,7 @@ class ReportNarrative(BaseModel):
         default_factory=list,
         description="3 concrete analytical drill-down questions the user should ask next based on the anomalies, top drivers, or risks uncovered."
     )
+    chart_specs: list[ChartSpec] = Field(default_factory=list)
 
 
 class ExecutiveReport(BaseModel):

@@ -20,11 +20,12 @@ class SQLGenerationAgent:
 
     def __init__(self, max_retries: int = MAX_SQL_RETRIES):
         self.max_retries = max_retries
-        self.full_schema = SchemaInspector().get_complete_schema()
+
 
     # ---------- helpers ----------
 
     def _schema_text(self, tables: list[str]) -> str:
+        self.full_schema = SchemaInspector().get_complete_schema()
         lines = []
         for table in tables:
             info = self.full_schema.get(table)
@@ -84,6 +85,9 @@ class SQLGenerationAgent:
                 return generated, execution, None
 
             last_error = result["error"]
+            # Deterministic RBAC block: fail fast on attempt 1 without wasting LLM retries
+            if last_error and "RBAC Access Denied" in last_error:
+                break
             messages.append(("model", draft.model_dump_json()))
             messages.append(("user",
                 f"That query failed ({result.get('error_type')}): {last_error}\n"

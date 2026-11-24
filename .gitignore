@@ -16,3 +16,9 @@ __pycache__/
 
 # Generated Charts & Reports
 outputs/
+tests/
+scripts/
+schemas/rep_sch_org.py
+reporting/exec_org.py
+reporting/charts_org.py
+agents/reporting_agent_org.py

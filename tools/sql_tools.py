@@ -1,10 +1,9 @@
-
 import sqlglot
 from sqlglot import exp
 from langchain_core.tools import tool
-from sqlalchemy import text
 from config.settings import MAX_SQL_ROWS
-from database.connection import get_engine
+from database.connection import get_engine, get_table_names
+from security.policy_guard import enforce_sql_policy
 
 
 def validate_sql(query: str) -> tuple[bool, str]:
@@ -20,8 +19,6 @@ def validate_sql(query: str) -> tuple[bool, str]:
         return False, "Only SELECT queries are allowed."
     return True, "SQL query is valid."
 
-
-from database.connection import get_engine, get_table_names
 
 def validate_tables(query: str) -> tuple[bool, str]:
     """Check that every referenced table really exists."""
@@ -44,9 +41,15 @@ def run_query(query: str) -> dict:
     ok, message = validate_tables(query)
     if not ok:
         return {"success": False, "error": message, "error_type": "validation"}
+
+    # Layer 3 Security: Enforce RBAC (tables/columns) + ABAC (row-level WHERE injection)
+    allowed, governed_query, sec_error = enforce_sql_policy(query, dialect="sqlite")
+    if not allowed:
+        return {"success": False, "error": sec_error, "error_type": "security_policy"}
+
     try:
         with get_engine().connect() as connection:
-            result = connection.exec_driver_sql(query)
+            result = connection.exec_driver_sql(governed_query)
             columns = list(result.keys())
             fetched = result.fetchmany(MAX_SQL_ROWS + 1)
     except Exception as error:
@@ -54,8 +57,15 @@ def run_query(query: str) -> dict:
 
     truncated = len(fetched) > MAX_SQL_ROWS
     rows = [dict(r._mapping) for r in fetched[:MAX_SQL_ROWS]]
-    return {"success": True, "columns": columns, "rows": rows,
-            "row_count": len(rows), "truncated": truncated, "max_rows": MAX_SQL_ROWS}
+    return {
+        "success": True,
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated": truncated,
+        "max_rows": MAX_SQL_ROWS,
+        "executed_sql": governed_query,
+    }
 
 
 def explain_query(query: str) -> dict:
@@ -63,23 +73,29 @@ def explain_query(query: str) -> dict:
     is_valid, message = validate_sql(query)
     if not is_valid:
         return {"success": False, "error": message, "error_type": "validation"}
+    allowed, governed_query, sec_error = enforce_sql_policy(query, dialect="sqlite")
+    if not allowed:
+        return {"success": False, "error": sec_error, "error_type": "security_policy"}
     try:
         with get_engine().connect() as connection:
-            plan = connection.exec_driver_sql(f"EXPLAIN QUERY PLAN {query}").fetchall()
+            plan = connection.exec_driver_sql(f"EXPLAIN QUERY PLAN {governed_query}").fetchall()
     except Exception as error:
         return {"success": False, "error": str(error), "error_type": "explain"}
     steps = [str(row[-1]) for row in plan]
-    return {"success": True, "plan": steps,
-            "full_table_scans": [s for s in steps if s.startswith("SCAN")]}
+    return {
+        "success": True,
+        "plan": steps,
+        "full_table_scans": [s for s in steps if s.startswith("SCAN")],
+    }
 
 
 @tool
 def execute_sql(query: str) -> dict:
-    """Validate and execute a read-only SQL query against Northwind."""
+    """Validate, enforce RBAC/ABAC policy, and execute a read-only SQL query."""
     return run_query(query)
 
 
 @tool
 def explain_sql(query: str) -> dict:
-    """Return the SQLite execution plan for a read-only query."""
+    """Return the SQLite execution plan for a policy-governed read-only query."""
     return explain_query(query)
