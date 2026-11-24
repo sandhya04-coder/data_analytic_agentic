@@ -11,7 +11,7 @@ class IntentUnderstandingAgent:
     into structured analytical requirements.
     """
 
-    def understand(self, question: str) -> BusinessIntent:
+    def understand(self, question: str, prior_context: str = "") -> BusinessIntent:
         """
         Understand a business question and return
         a validated BusinessIntent object.
@@ -22,16 +22,22 @@ class IntentUnderstandingAgent:
                 "Please provide a valid business question."
             )
 
-        messages = [
-            SystemMessage(content=INTENT_AGENT_SYSTEM_PROMPT),
-            HumanMessage(content=question.strip())
-        ]
+        clean_question = question.strip()
+        prompt_text = clean_question
+        if prior_context and prior_context.strip():
+            prompt_text = (
+                f"CONVERSATION CONTEXT (from the immediately preceding turn):\n"
+                f"{prior_context.strip()}\n\n"
+                f"CURRENT FOLLOW-UP QUESTION:\n"
+                f"{clean_question}\n\n"
+                f"Resolve any references (e.g., 'that category', 'those states', 'break that down') "
+                f"using the conversation context above so the resulting BusinessIntent is completely self-contained."
+            )
 
         try:
-            
             intent = generate_structured(
                 BusinessIntent,
-                [("user", question.strip())],
+                [("user", prompt_text)],
                 system_prompt=INTENT_AGENT_SYSTEM_PROMPT,
             )
 
@@ -41,7 +47,7 @@ class IntentUnderstandingAgent:
                 )
 
             # Preserve the exact question submitted by the user.
-            intent.original_question = question.strip()
+            intent.original_question = clean_question
 
             return intent
 

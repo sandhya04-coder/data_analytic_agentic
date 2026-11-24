@@ -10,6 +10,7 @@ from schemas.reporting_schema import ExecutiveReport
 class AnalyticsState(TypedDict, total=False):
     # Input & human-in-the-loop clarification
     question: str
+    prior_context: str | None
     clarification_response: str | None
 
     # Agent 1 output

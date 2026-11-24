@@ -137,9 +137,11 @@ class AnalysisAgent:
                 "rows": ex.rows[:100],
             })
 
+        planned_tasks_json = json.dumps([t.model_dump() for t in plan.tasks], indent=2, default=str)
         prompt_payload = (
             f"ORIGINAL QUESTION: {intent.original_question}\n\n"
             f"BUSINESS INTENT:\n{intent.model_dump_json(indent=2)}\n\n"
+            f"PLANNED TASKS:\n{planned_tasks_json}\n\n"
             f"DATA LIMITATIONS:\n{json.dumps(plan.data_limitations)}\n\n"
             f"SQL RESULTS:\n{json.dumps(query_summaries, indent=2, default=str)}\n\n"
             f"DETERMINISTIC ANALYTICS CALCULATIONS:\n{json.dumps(deterministic, indent=2, default=str)}\n\n"
