@@ -1,7 +1,14 @@
+from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
+import re
+from sqlalchemy import inspect
 import sqlglot
 from sqlglot import exp
+
+from database.connection import get_engine
 
 
 @dataclass(frozen=True)
@@ -9,9 +16,10 @@ class AccessPolicy:
     policy_id: str
     display_name: str
     db_key: str
-    allowed_tables: set[str] | None = None  # None = all tables in db_key allowed
-    blocked_columns: dict[str, set[str]] = field(default_factory=dict)  # {"table": {"col1", "col2"}}
-    row_filters: dict[str, str] = field(default_factory=dict)           # {"table": "col = 'VAL'"}
+    allowed_tables: set[str] | None = None
+    blocked_columns: dict[str, set[str]] = field(default_factory=dict)
+    row_filters: dict[str, str] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class SSOUser:
@@ -23,105 +31,123 @@ class SSOUser:
     claims: dict[str, str]
 
 
-SSO_USERS: dict[str, SSOUser] = {
-    "ana.exec@olist.com.br": SSOUser(
-        email="ana.exec@olist.com.br",
-        full_name="Ana Costa",
-        title="VP of E-Commerce (Olist)",
-        db_key="olist",
-        policy_key="exec_admin",
-        claims={"tenant": "olist", "role": "executive_admin", "clearance": "ALL"},
-    ),
-    "carlos.sp@olist.com.br": SSOUser(
-        email="carlos.sp@olist.com.br",
-        full_name="Carlos Silva",
-        title="State Manager • São Paulo (Olist)",
-        db_key="olist",
-        policy_key="sp_state_mgr",
-        claims={"tenant": "olist", "role": "regional_manager", "assigned_state": "SP"},
-    ),
-    "julia.fin@olist.com.br": SSOUser(
-        email="julia.fin@olist.com.br",
-        full_name="Julia Mendes",
-        title="Financial Controller (Olist)",
-        db_key="olist",
-        policy_key="finance_analyst",
-        claims={"tenant": "olist", "role": "finance_analyst", "scope": "orders,payments,items"},
-    ),
-    "sarah.exec@northwind.com": SSOUser(
-        email="sarah.exec@northwind.com",
-        full_name="Sarah Jenkins",
-        title="Chief Revenue Officer (Northwind)",
-        db_key="northwind",
-        policy_key="exec_admin",
-        claims={"tenant": "northwind", "role": "executive_admin", "clearance": "ALL"},
-    ),
-    "marc.eu@northwind.com": SSOUser(
-        email="marc.eu@northwind.com",
-        full_name="Marc Laurent",
-        title="Regional Director • Western Europe (Northwind)",
-        db_key="northwind",
-        policy_key="we_regional_mgr",
-        claims={"tenant": "northwind", "role": "regional_manager", "assigned_region": "Western Europe"},
-    ),
-}
-# Multi-tenant RBAC + ABAC policy catalog
-POLICIES_BY_DB: dict[str, dict[str, AccessPolicy]] = {
-    "northwind": {
-        "exec_admin": AccessPolicy(
-            policy_id="exec_admin",
-            display_name="Executive Admin (Full Access)",
-            db_key="northwind",
-        ),
-        "we_regional_mgr": AccessPolicy(
-            policy_id="we_regional_mgr",
-            display_name="Regional Manager • Western Europe (ABAC)",
-            db_key="northwind",
-            blocked_columns={"Employees": {"BirthDate", "HomePhone", "Address", "Notes"}},
-            row_filters={"Orders": "ShipRegion = 'Western Europe'"},
-        ),
-        "sales_analyst": AccessPolicy(
-            policy_id="sales_analyst",
-            display_name="Sales Analyst • No HR/Suppliers (RBAC)",
-            db_key="northwind",
-            allowed_tables={"Orders", "Order Details", "Products", "Categories", "Customers"},
-        ),
-    },
-    "olist": {
-        "exec_admin": AccessPolicy(
-            policy_id="exec_admin",
-            display_name="Executive Admin (Full Access)",
-            db_key="olist",
-        ),
-        "sp_state_mgr": AccessPolicy(
-            policy_id="sp_state_mgr",
-            display_name="State Manager • São Paulo SP (ABAC)",
-            db_key="olist",
-            blocked_columns={"customers": {"customer_zip_code_prefix"}, "sellers": {"seller_zip_code_prefix"}},
-            row_filters={"customers": "customer_state = 'SP'"},
-        ),
-        "finance_analyst": AccessPolicy(
-            policy_id="finance_analyst",
-            display_name="Finance Analyst • Orders & Payments Only (RBAC)",
-            db_key="olist",
-            allowed_tables={"orders", "order_payments", "order_items"},
-        ),
-    },
-}
-
 _ACTIVE_POLICY: ContextVar[AccessPolicy | None] = ContextVar("active_policy", default=None)
+_FK_GRAPH_CACHE: dict[str, dict[str, list[tuple[str, str, str]]]] = {}
+
+DEFAULT_POLICY_PATH = Path(__file__).resolve().parent.parent / "config" / "policies.json"
+
+DEFAULT_POLICY_PATH = Path(__file__).resolve().parent.parent / "config" / "policies.json"
+DEFAULT_USERS_PATH = Path(__file__).resolve().parent.parent / "config" / "users.json"
 
 
-def get_policies_for_db(db_key: str) -> dict[str, AccessPolicy]:
-    if db_key in POLICIES_BY_DB:
-        return POLICIES_BY_DB[db_key]
+def load_sso_users(users_path: Path = DEFAULT_USERS_PATH) -> dict[str, SSOUser]:
+    """Load SSO user personas dynamically from external JSON config."""
+    if not users_path.exists():
+        return {}
+    with open(users_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
     return {
-        "exec_admin": AccessPolicy(
-            policy_id="exec_admin",
-            display_name="Executive Admin (Full Access)",
-            db_key=db_key,
+        u["email"]: SSOUser(
+            email=u["email"],
+            full_name=u["full_name"],
+            title=u["title"],
+            db_key=u["db_key"],
+            policy_key=u["policy_key"],
+            claims=u.get("claims", {}),
         )
+        for u in data.get("users", [])
     }
+
+
+SSO_USERS: dict[str, SSOUser] = load_sso_users()
+
+# ---------------------------------------------------------------------------
+# 1. External Policy Loader & Dynamic SSO Claim Binding
+# ---------------------------------------------------------------------------
+
+def _render_claim_template(template: str, claims: dict[str, str]) -> str:
+    """Safely substitute {claim_key} placeholders with SQL-escaped SSO claim values."""
+    def _replace(match: re.Match) -> str:
+        key = match.group(1)
+        if key not in claims:
+            raise ValueError(f"Missing required SSO claim '{key}' for policy template '{template}'.")
+        # Escape single quotes to prevent claim-based SQL injection
+        return str(claims[key]).replace("'", "''")
+
+    return re.sub(r"\{([a-zA-Z0-9_]+)\}", _replace, template)
+
+
+def load_policy_catalog(policy_path: Path = DEFAULT_POLICY_PATH) -> dict:
+    with open(policy_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def resolve_policy_for_user(user: SSOUser, policy_path: Path = DEFAULT_POLICY_PATH) -> AccessPolicy:
+    """Build an AccessPolicy dynamically from external JSON config + user's SSO claims."""
+    catalog = load_policy_catalog(policy_path)
+    db_policies = catalog.get("databases", {}).get(user.db_key, {})
+    raw = db_policies.get(user.policy_key)
+
+    if not raw:
+        return AccessPolicy(
+            policy_id=user.policy_key,
+            display_name=f"{user.title} (Default Policy)",
+            db_key=user.db_key,
+        )
+
+    display_name = _render_claim_template(raw.get("display_name", user.policy_key), user.claims)
+    allowed = set(raw["allowed_tables"]) if raw.get("allowed_tables") is not None else None
+    blocked = {tbl: set(cols) for tbl, cols in raw.get("blocked_columns", {}).items()}
+    row_filters = {
+        tbl: _render_claim_template(expr, user.claims)
+        for tbl, expr in raw.get("row_filters", {}).items()
+    }
+
+    return AccessPolicy(
+        policy_id=user.policy_key,
+        display_name=display_name,
+        db_key=user.db_key,
+        allowed_tables=allowed,
+        blocked_columns=blocked,
+        row_filters=row_filters,
+    )
+
+
+def get_policies_for_db(
+    db_key: str,
+    sample_claims: dict[str, str] | None = None,
+    policy_path: Path = DEFAULT_POLICY_PATH,
+) -> dict[str, AccessPolicy]:
+    """Return available policy templates for UI selection or fallback inspection."""
+    catalog = load_policy_catalog(policy_path)
+    db_policies = catalog.get("databases", {}).get(db_key, {})
+    if not db_policies:
+        return {
+            "exec_admin": AccessPolicy(
+                policy_id="exec_admin",
+                display_name="Executive Admin (Full Access)",
+                db_key=db_key,
+            )
+        }
+
+    claims = sample_claims or {}
+    result: dict[str, AccessPolicy] = {}
+    for pol_id, raw in db_policies.items():
+        try:
+            dummy_user = SSOUser("", "", pol_id, db_key, pol_id, claims)
+            result[pol_id] = resolve_policy_for_user(dummy_user, policy_path)
+        except ValueError:
+            # Template requires user-specific claims (e.g. assigned_state)
+            result[pol_id] = AccessPolicy(
+                policy_id=pol_id,
+                display_name=raw.get("display_name", pol_id),
+                db_key=db_key,
+                allowed_tables=set(raw["allowed_tables"]) if raw.get("allowed_tables") is not None else None,
+                blocked_columns={t: set(c) for t, c in raw.get("blocked_columns", {}).items()},
+                row_filters=raw.get("row_filters", {}),
+            )
+    return result
 
 
 def set_active_policy(policy: AccessPolicy | None) -> None:
@@ -132,8 +158,12 @@ def get_active_policy() -> AccessPolicy | None:
     return _ACTIVE_POLICY.get()
 
 
+# ---------------------------------------------------------------------------
+# 2. Checkpoint 1: Schema Masking
+# ---------------------------------------------------------------------------
+
 def filter_schema_for_policy(schema: dict, policy: AccessPolicy | None) -> dict:
-    """Checkpoint 1: Strip unauthorized tables & columns before LLM planning/SQL generation."""
+    """Strip unauthorized tables & columns before LLM planning/SQL generation."""
     if policy is None:
         return schema
 
@@ -156,15 +186,154 @@ def filter_schema_for_policy(schema: dict, policy: AccessPolicy | None) -> dict:
     return filtered
 
 
+# ---------------------------------------------------------------------------
+# 3. Dynamic Foreign-Key Graph & Transitive EXISTS AST Synthesizer
+# ---------------------------------------------------------------------------
+
+def _get_fk_adjacency(db_key: str) -> dict[str, list[tuple[str, str, str]]]:
+    """
+    Introspect live database relationships via SQLAlchemy Inspector:
+      1. Uses formal FOREIGN KEY constraints when declared (e.g., Northwind).
+      2. Falls back to automatic PK / <singular_table>_id column matching for
+         CSV-imported SQLite databases lacking FK DDL (e.g., Olist).
+    Returns bidirectional adjacency map:
+      table_lower -> [(neighbor_table_actual, local_col, remote_col), ...]
+    """
+    if db_key in _FK_GRAPH_CACHE:
+        return _FK_GRAPH_CACHE[db_key]
+
+    inspector = inspect(get_engine())
+    tables = inspector.get_table_names()
+    adj: dict[str, list[tuple[str, str, str]]] = {t.lower(): [] for t in tables}
+
+    # 1. Formal FOREIGN KEY constraints
+    for tbl in tables:
+        for fk in inspector.get_foreign_keys(tbl):
+            ref_tbl = fk.get("referred_table")
+            local_cols = fk.get("constrained_columns") or []
+            remote_cols = fk.get("referred_columns") or []
+            if not ref_tbl or not local_cols or not remote_cols:
+                continue
+
+            l_col, r_col = local_cols[0], remote_cols[0]
+            adj[tbl.lower()].append((ref_tbl, l_col, r_col))
+            adj.setdefault(ref_tbl.lower(), []).append((tbl, r_col, l_col))
+
+    # 2. Schema-convention fallback when no formal FKs exist (CSV-imported DBs)
+    if not any(adj.values()):
+        pk_by_col: dict[str, tuple[str, str]] = {}
+        for tbl in tables:
+            pk_cols = inspector.get_pk_constraint(tbl).get("constrained_columns") or []
+            if len(pk_cols) == 1:
+                pk_by_col[pk_cols[0].lower()] = (tbl, pk_cols[0])
+            else:
+                singular = tbl[:-1] if tbl.lower().endswith("s") else tbl
+                candidate = f"{singular.lower()}_id"
+                for col_info in inspector.get_columns(tbl):
+                    if col_info["name"].lower() == candidate:
+                        pk_by_col[candidate] = (tbl, col_info["name"])
+
+        for tbl in tables:
+            for col_info in inspector.get_columns(tbl):
+                col_name = col_info["name"]
+                match = pk_by_col.get(col_name.lower())
+                if match and match[0].lower() != tbl.lower():
+                    ref_tbl, ref_col = match
+                    adj[tbl.lower()].append((ref_tbl, col_name, ref_col))
+                    adj[ref_tbl.lower()].append((tbl, ref_col, col_name))
+
+    _FK_GRAPH_CACHE[db_key] = adj
+    return adj
+
+
+def _find_fk_path(
+    adj: dict[str, list[tuple[str, str, str]]],
+    start_table_lower: str,
+    target_table_lower: str,
+) -> list[tuple[str, str, str]] | None:
+    """BFS shortest join path from queried table -> ABAC-protected parent table."""
+    if start_table_lower == target_table_lower or start_table_lower not in adj:
+        return None
+
+    queue: deque[tuple[str, list[tuple[str, str, str]]]] = deque([(start_table_lower, [])])
+    visited = {start_table_lower}
+
+    while queue:
+        curr, path = queue.popleft()
+        for next_tbl, local_col, remote_col in adj.get(curr, []):
+            nxt_lower = next_tbl.lower()
+            if nxt_lower in visited:
+                continue
+            new_path = path + [(next_tbl, local_col, remote_col)]
+            if nxt_lower == target_table_lower:
+                return new_path
+            visited.add(nxt_lower)
+            queue.append((nxt_lower, new_path))
+
+    return None
+
+
+def _build_transitive_exists_ast(
+    queried_alias: str,
+    fk_path: list[tuple[str, str, str]],
+    row_predicate_sql: str,
+    dialect: str = "sqlite",
+) -> exp.Exists:
+    """
+    Dynamically synthesize an EXISTS subquery AST from a discovered FK path:
+      EXISTS (
+        SELECT 1 FROM <hop_1> _abac_0
+        [JOIN <hop_2> _abac_1 ON _abac_0.<fk> = _abac_1.<pk>]
+        WHERE _abac_0.<fk> = <queried_alias>.<local_col>
+          AND _abac_<last>.<row_predicate>
+      )
+    """
+    first_tbl, first_local_col, first_remote_col = fk_path[0]
+    first_alias = "_abac_0"
+
+    subq = (
+        exp.select(exp.Literal.number(1))
+        .from_(exp.table_(first_tbl, alias=first_alias, quoted=True))
+    )
+
+    prev_alias = first_alias
+    for idx, (hop_tbl, local_col, remote_col) in enumerate(fk_path[1:], start=1):
+        hop_alias = f"_abac_{idx}"
+        on_cond = exp.EQ(
+            this=exp.column(local_col, table=prev_alias, quoted=True),
+            expression=exp.column(remote_col, table=hop_alias, quoted=True),
+        )
+        subq = subq.join(exp.table_(hop_tbl, alias=hop_alias, quoted=True), on=on_cond)
+        prev_alias = hop_alias
+
+    # Link hop 0 back to outer queried table alias
+    link_cond = exp.EQ(
+        this=exp.column(first_remote_col, table=first_alias, quoted=True),
+        expression=exp.column(first_local_col, table=queried_alias, quoted=True),
+    )
+
+    # Qualify unqualified columns in row_predicate with the terminal ABAC table alias
+    pred_expr = sqlglot.parse_one(row_predicate_sql, read=dialect)
+    for col in pred_expr.find_all(exp.Column):
+        if not col.table:
+            col.set("table", exp.to_identifier(prev_alias))
+
+    subq = subq.where(exp.and_(link_cond, pred_expr))
+    return exp.Exists(this=subq)
+
+
+# ---------------------------------------------------------------------------
+# 4. Checkpoint 2: AST Policy Enforcement
+# ---------------------------------------------------------------------------
+
 def enforce_sql_policy(
     sql: str,
     policy: AccessPolicy | None = None,
     dialect: str = "sqlite",
 ) -> tuple[bool, str, str]:
     """
-    Checkpoint 2: Deterministically validate RBAC and inject ABAC row-level WHERE predicates
-    via sqlglot AST rewriting.
-    Returns: (is_allowed, rewritten_sql, error_message)
+    Deterministically validate RBAC and inject direct + transitive ABAC row-level WHERE
+    predicates via sqlglot AST rewriting. Zero hardcoded schema names.
     """
     active = policy if policy is not None else get_active_policy()
     if active is None:
@@ -222,45 +391,43 @@ def enforce_sql_policy(
                             f"RBAC Access Denied: Column '{col.name}' on '{restricted_tbl}' is restricted for role '{active.display_name}'.",
                         )
 
-    # 3. ABAC Row-Level Predicate Injection
+    # 3. Direct + Dynamic Transitive ABAC Row-Level Predicate Injection
     if active.row_filters:
-        for select_node in parsed.find_all(exp.Select):
-            for tbl in select_node.find_all(exp.Table):
-                if tbl.find_ancestor(exp.Select) is not select_node:
-                    continue
-                for target_tbl, predicate_sql in active.row_filters.items():
-                    if tbl.name.lower() == target_tbl.lower():
-                        qualifier = tbl.alias_or_name
-                        predicate_expr = sqlglot.parse_one(predicate_sql, read=dialect)
-                        for p_col in predicate_expr.find_all(exp.Column):
-                            if not p_col.table:
-                                p_col.set("table", exp.to_identifier(qualifier))
-                        select_node.where(predicate_expr, append=True, copy=False)
+        row_filters_lower = {t.lower(): pred for t, pred in active.row_filters.items()}
+        fk_adj = _get_fk_adjacency(active.db_key)
 
-    # 3b. Transitive ABAC Protection for Olist fact tables when 'customers' isn't directly joined
-    if active.db_key == "olist" and "customers" in {k.lower() for k in active.row_filters}:
-        cust_filter = next(v for k, v in active.row_filters.items() if k.lower() == "customers")
         for select_node in parsed.find_all(exp.Select):
             direct_tables = {
                 t.name.lower(): t.alias_or_name
                 for t in select_node.find_all(exp.Table)
-                if t.find_ancestor(exp.Select) is select_node
+                if t.find_ancestor(exp.Select) is select_node and t.name.lower() not in cte_names
             }
-            if "customers" not in direct_tables:
-                if "orders" in direct_tables:
-                    o_alias = direct_tables["orders"]
-                    subq = (
-                        f"EXISTS (SELECT 1 FROM customers _abac_c "
-                        f"WHERE _abac_c.customer_id = {o_alias}.customer_id AND _abac_c.{cust_filter})"
-                    )
-                    select_node.where(sqlglot.parse_one(subq, read=dialect), append=True, copy=False)
-                elif "order_items" in direct_tables:
-                    oi_alias = direct_tables["order_items"]
-                    subq = (
-                        f"EXISTS (SELECT 1 FROM orders _abac_o "
-                        f"JOIN customers _abac_c ON _abac_o.customer_id = _abac_c.customer_id "
-                        f"WHERE _abac_o.order_id = {oi_alias}.order_id AND _abac_c.{cust_filter})"
-                    )
-                    select_node.where(sqlglot.parse_one(subq, read=dialect), append=True, copy=False)
+
+            # 3a. Direct ABAC predicates on queried tables
+            for tbl_lower, qualifier in direct_tables.items():
+                predicate_sql = row_filters_lower.get(tbl_lower)
+                if predicate_sql:
+                    predicate_expr = sqlglot.parse_one(predicate_sql, read=dialect)
+                    for p_col in predicate_expr.find_all(exp.Column):
+                        if not p_col.table:
+                            p_col.set("table", exp.to_identifier(qualifier))
+                    select_node.where(predicate_expr, append=True, copy=False)
+
+            # 3b. Dynamic Transitive ABAC via FK graph BFS when protected table isn't directly joined
+            for protected_tbl_lower, predicate_sql in row_filters_lower.items():
+                if protected_tbl_lower in direct_tables:
+                    continue  # Already covered by direct filter above
+
+                for queried_tbl_lower, qualifier in direct_tables.items():
+                    fk_path = _find_fk_path(fk_adj, queried_tbl_lower, protected_tbl_lower)
+                    if fk_path:
+                        exists_ast = _build_transitive_exists_ast(
+                            queried_alias=qualifier,
+                            fk_path=fk_path,
+                            row_predicate_sql=predicate_sql,
+                            dialect=dialect,
+                        )
+                        select_node.where(exists_ast, append=True, copy=False)
+                        break
 
     return True, parsed.sql(dialect=dialect), ""

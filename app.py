@@ -5,7 +5,13 @@ import streamlit as st
 from datetime import datetime
 from langgraph.types import Command
 from sqlalchemy import text
-from security.policy_guard import SSO_USERS, get_policies_for_db, set_active_policy
+# Line 8: Import resolve_policy_for_user
+from security.policy_guard import (
+    SSO_USERS,
+    get_policies_for_db,
+    resolve_policy_for_user,
+    set_active_policy,
+)
 from database.connection import (
     get_engine,
     get_table_names,
@@ -164,6 +170,8 @@ if "auto_run_question" not in st.session_state:
     st.session_state.auto_run_question = None
 if "audit_log" not in st.session_state:
     st.session_state.audit_log = []
+if "active_question" not in st.session_state:         
+    st.session_state.active_question = ""
 
 # ---------------------------------------------------------------------------
 # Sidebar: Multi-Tenant Database Switcher, Pulse & Sample Prompts
@@ -183,8 +191,10 @@ with st.sidebar:
         st.session_state.active_sso_email = selected_email
         st.session_state.result_state = None
         st.session_state.pending_clarification = None
+        st.session_state.active_question = ""
+    # Line 154: Resolve user-specific claims instead of raw policy lookup
     selected_db = current_user.db_key
-    active_policy = get_policies_for_db(selected_db)[current_user.policy_key]
+    active_policy = resolve_policy_for_user(current_user)
 
     set_active_database(selected_db)
     set_active_policy(active_policy)
@@ -234,7 +244,7 @@ st.markdown(
 
 queued_q = st.session_state.pop("auto_run_question", None)
 
-with st.form("query_form", clear_on_submit=True):
+with st.form("query_form", clear_on_submit=False):
     col_q, col_btn = st.columns([5, 1])
     user_question = col_q.text_input(
         f"Ask a business question about {selected_db.title()} data:",
@@ -255,6 +265,7 @@ else:
     active_question = ""
 
 if active_question:
+    st.session_state.active_question = active_question
     set_active_database(selected_db)
     set_active_policy(active_policy)
     st.session_state.thread_id = str(uuid.uuid4())
@@ -316,9 +327,29 @@ if st.session_state.pending_clarification:
 
 # ---------------------------------------------------------------------------
 # Main Workspace Tabs
-# ---------------------------------------------------------------------------
+#---------------------------------------------------------------------------
 state = st.session_state.result_state
 
+displayed_q = st.session_state.active_question or (state.get("question", "") if state else "")
+if displayed_q:
+    st.markdown(
+        f"""
+        <div style="
+            background: #f1f5f9;
+            border-left: 4px solid #0ea5e9;
+            padding: 0.75rem 1.1rem;
+            border-radius: 8px;
+            margin: 0.4rem 0 1rem 0;
+            color: #0f172a;
+        ">
+            <span style="font-size:0.75rem; font-weight:700; text-transform:uppercase; color:#0369a1; letter-spacing:0.04em;">
+                Active Analytical Question
+            </span><br/>
+            <span style="font-size:1.05rem; font-weight:600;">{displayed_q}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 tab_report, tab_sql, tab_pipeline, tab_db = st.tabs(
     [
         " Executive Report & Charts",

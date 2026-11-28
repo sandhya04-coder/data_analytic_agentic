@@ -1,0 +1,64 @@
+{
+    "users": [
+        {
+            "email": "ana.exec@olist.com.br",
+            "full_name": "Ana Costa",
+            "title": "VP of E-Commerce (Olist)",
+            "db_key": "olist",
+            "policy_key": "exec_admin",
+            "claims": {
+                "tenant": "olist",
+                "role": "executive_admin",
+                "clearance": "ALL"
+            }
+        },
+        {
+            "email": "carlos.sp@olist.com.br",
+            "full_name": "Carlos Silva",
+            "title": "State Manager • São Paulo (Olist)",
+            "db_key": "olist",
+            "policy_key": "regional_manager",
+            "claims": {
+                "tenant": "olist",
+                "role": "regional_manager",
+                "assigned_state": "SP"
+            }
+        },
+        {
+            "email": "julia.fin@olist.com.br",
+            "full_name": "Julia Mendes",
+            "title": "Financial Controller (Olist)",
+            "db_key": "olist",
+            "policy_key": "finance_analyst",
+            "claims": {
+                "tenant": "olist",
+                "role": "finance_analyst",
+                "scope": "orders,payments,items"
+            }
+        },
+        {
+            "email": "sarah.exec@northwind.com",
+            "full_name": "Sarah Jenkins",
+            "title": "Chief Revenue Officer (Northwind)",
+            "db_key": "northwind",
+            "policy_key": "exec_admin",
+            "claims": {
+                "tenant": "northwind",
+                "role": "executive_admin",
+                "clearance": "ALL"
+            }
+        },
+        {
+            "email": "marc.eu@northwind.com",
+            "full_name": "Marc Laurent",
+            "title": "Regional Director • Western Europe (Northwind)",
+            "db_key": "northwind",
+            "policy_key": "regional_manager",
+            "claims": {
+                "tenant": "northwind",
+                "role": "regional_manager",
+                "assigned_region": "Western Europe"
+            }
+        }
+    ]
+}

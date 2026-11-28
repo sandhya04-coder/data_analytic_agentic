@@ -1,0 +1,60 @@
+{
+    "databases": {
+        "northwind": {
+            "exec_admin": {
+                "display_name": "Executive Admin (Full Access)"
+            },
+            "regional_manager": {
+                "display_name": "Regional Manager • {assigned_region} (ABAC)",
+                "blocked_columns": {
+                    "Employees": [
+                        "BirthDate",
+                        "HomePhone",
+                        "Address",
+                        "Notes"
+                    ]
+                },
+                "row_filters": {
+                    "Orders": "ShipRegion = '{assigned_region}'"
+                }
+            },
+            "sales_analyst": {
+                "display_name": "Sales Analyst • No HR/Suppliers (RBAC)",
+                "allowed_tables": [
+                    "Orders",
+                    "Order Details",
+                    "Products",
+                    "Categories",
+                    "Customers"
+                ]
+            }
+        },
+        "olist": {
+            "exec_admin": {
+                "display_name": "Executive Admin (Full Access)"
+            },
+            "regional_manager": {
+                "display_name": "State Manager • {assigned_state} (ABAC)",
+                "blocked_columns": {
+                    "customers": [
+                        "customer_zip_code_prefix"
+                    ],
+                    "sellers": [
+                        "seller_zip_code_prefix"
+                    ]
+                },
+                "row_filters": {
+                    "customers": "customer_state = '{assigned_state}'"
+                }
+            },
+            "finance_analyst": {
+                "display_name": "Finance Analyst • Orders & Payments Only (RBAC)",
+                "allowed_tables": [
+                    "orders",
+                    "order_payments",
+                    "order_items"
+                ]
+            }
+        }
+    }
+}
